@@ -1,0 +1,64 @@
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated Go test names; empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    name: build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Produce the module zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Pack the zip from a copy of the tree with this workflow removed:
+          # upstream golang.org/x/net ships no .github directory, so the
+          # published module zip has no .github members and ours must not
+          # either. zip.CreateFromDir already drops .git/ and nested modules.
+          cp -a "${GITHUB_WORKSPACE}" "${RUNNER_TEMP}/modsrc"
+          rm -rf "${RUNNER_TEMP}/modsrc/.github"
+          mkdir -p "${GITHUB_WORKSPACE}/build_output"
+          # The zipper is its own module under .github/, so `go mod download`
+          # here cannot touch golang.org/x/net's own go.mod or go.sum.
+          cd "${GITHUB_WORKSPACE}/.github/zipper"
+          go mod download golang.org/x/mod
+          go run ./create_mod.go golang.org/x/net v0.45.0 \
+            "${RUNNER_TEMP}/modsrc" "${GITHUB_WORKSPACE}/build_output/v0.45.0.zip"
+
+      - name: Upload the module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: build_output/v0.45.0.zip
+          if-no-files-found: error
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            go test -v -run "^($(echo "${{ inputs.test-filter }}" | tr ' ' '|'))$" ./... 2>&1 | tee /tmp/scoped.log
+            for t in ${{ inputs.test-filter }}; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" /tmp/scoped.log || exit 1
+            done
+          else
+            go test ./...
+          fi
